@@ -10,6 +10,7 @@ use Domain\Sanctions\SanctionsRepository;
 use Domain\Users\UserRepository;
 use Domain\Decisions\DecisionRepository;
 use Domain\Decisions\IdempotencyRepository;
+use Domain\Decisions\CaseRepository;
 use Domain\Risk\RiskEngine;
 use Infrastructure\Clock\SystemClock;
 
@@ -22,6 +23,7 @@ final class Bootstrap {
     $users = new UserRepository($pdo);
     $decisions = new DecisionRepository($pdo);
     $idempo = new IdempotencyRepository($pdo);
+    $cases = new CaseRepository($pdo);
     $sanctions = new SanctionsRepository($pdo);
     $risk = new RiskEngine($cfg['risk'], $users, $decisions, $sanctions);
     $clock = new SystemClock();
@@ -44,7 +46,34 @@ final class Bootstrap {
       JsonResponse::send(201, ['ok'=>true]);
     });
 
-    $r->add('POST', '/evaluate', function(Request $req) use ($risk, $users, $decisions, $idempo, $clock) {
+    // List cases
+    $r->add('GET', '/cases', function(Request $req) use ($cases) {
+      $status = $_GET['status'] ?? 'open';
+      $status = strtolower((string)$status);
+      if (!in_array($status, ['open','resolved'], true)) {
+        JsonResponse::send(422, ['error'=>'validation', 'field'=>'status', 'allowed'=>['open','resolved']]);
+        return;
+      }
+      $rows = $cases->list($status === 'open' ? 'OPEN' : 'RESOLVED', 50);
+      foreach ($rows as &$row) {
+        $row['reasons'] = json_decode((string)$row['reasons_json'], true);
+        unset($row['reasons_json']);
+      }
+      JsonResponse::send(200, ['cases'=>$rows]);
+    });
+
+    // Get case by id: /cases/{id}
+    $r->add('GET', '/case', function() {
+      JsonResponse::send(400, ['error'=>'use /cases/{id}']);
+    });
+
+    // Resolve case: /cases/{id}/resolve
+    $r->add('POST', '/case/resolve', function() {
+      JsonResponse::send(400, ['error'=>'use /cases/{id}/resolve']);
+    });
+
+    // Evaluate endpoint with idempotency + case creation
+    $r->add('POST', '/evaluate', function(Request $req) use ($risk, $users, $decisions, $idempo, $cases, $clock) {
       $b = $req->json();
 
       $required = ['user_id','action','amount_minor','currency','counterparty'];
@@ -65,7 +94,6 @@ final class Bootstrap {
         'device_id' => isset($b['device_id']) ? (string)$b['device_id'] : null,
       ];
 
-      // Idempotency
       $idempoKey = $req->header('Idempotency-Key') ?? (isset($b['idempotency_key']) ? (string)$b['idempotency_key'] : null);
       if (!$idempoKey) {
         JsonResponse::send(422, ['error'=>'validation', 'missing'=>'Idempotency-Key']);
@@ -100,7 +128,7 @@ final class Bootstrap {
 
       $result = $risk->evaluate($input);
 
-      // Update baseline using recent history (simple rolling stats)
+      // Update rolling baseline
       $amounts = $decisions->recentAmounts($input['user_id'], 30);
       $amounts[] = $input['amount_minor'];
 
@@ -112,6 +140,22 @@ final class Bootstrap {
 
       $decisionId = bin2hex(random_bytes(16));
       $createdAt = $clock->nowIso();
+
+      // If HOLD/REVIEW, open a case
+      $caseId = null;
+      if (in_array($result['outcome'], ['HOLD','REVIEW'], true)) {
+        $caseId = bin2hex(random_bytes(16));
+        $cases->open([
+          'id'=>$caseId,
+          'user_id'=>$input['user_id'],
+          'decision_id'=>$decisionId,
+          'risk_score'=>$result['risk_score'],
+          'risk_tier'=>$result['risk_tier'],
+          'outcome'=>$result['outcome'],
+          'reasons'=>$result['reasons'],
+          'opened_at'=>$createdAt
+        ]);
+      }
 
       $decisions->store([
         'id' => $decisionId,
@@ -127,6 +171,7 @@ final class Bootstrap {
         'risk_tier' => $result['risk_tier'],
         'reasons' => $result['reasons'],
         'created_at' => $createdAt,
+        'case_id' => $caseId
       ]);
 
       $users->updateSignals($input['user_id'], $input['device_id'], $input['country']);
@@ -134,6 +179,7 @@ final class Bootstrap {
 
       $response = [
         'decision_id' => $decisionId,
+        'case_id' => $caseId,
         'outcome' => $result['outcome'],
         'risk_score' => $result['risk_score'],
         'risk_tier' => $result['risk_tier'],
@@ -141,12 +187,63 @@ final class Bootstrap {
         'signals' => $result['signals']
       ];
 
-      // store idempotency record
       $idempo->save($idempoKey, $input['user_id'], $requestHash, $response, $decisionId);
 
       JsonResponse::send(200, $response);
     });
 
-    return $r;
+    // Dynamic routes handling: we’ll do simple dispatcher based on path patterns
+    $r->add('GET', '/_dynamic', function(Request $req) use ($cases) {
+      $p = $req->path();
+      // /cases/{id}
+      if (preg_match('#^/cases/([a-f0-9]{32})$#', $p, $m)) {
+        $row = $cases->get($m[1]);
+        if (!$row) { JsonResponse::send(404, ['error'=>'not_found']); return; }
+        $row['reasons'] = json_decode((string)$row['reasons_json'], true);
+        unset($row['reasons_json']);
+        JsonResponse::send(200, ['case'=>$row]);
+        return;
+      }
+      JsonResponse::send(404, ['error'=>'not_found', 'path'=>$p]);
+    });
+
+    $r->add('POST', '/_dynamic', function(Request $req) use ($cases) {
+      $p = $req->path();
+      // /cases/{id}/resolve
+      if (preg_match('#^/cases/([a-f0-9]{32})/resolve$#', $p, $m)) {
+        $b = $req->json();
+        $resolution = strtoupper((string)($b['resolution'] ?? ''));
+        $notes = (string)($b['notes'] ?? '');
+        if (!in_array($resolution, ['APPROVE','DENY'], true)) {
+          JsonResponse::send(422, ['error'=>'validation', 'field'=>'resolution', 'allowed'=>['APPROVE','DENY']]);
+          return;
+        }
+        $ok = $cases->resolve($m[1], $resolution, $notes);
+        if (!$ok) { JsonResponse::send(409, ['error'=>'case_not_open_or_missing']); return; }
+        JsonResponse::send(200, ['ok'=>true]);
+        return;
+      }
+      JsonResponse::send(404, ['error'=>'not_found', 'path'=>$p]);
+    });
+
+    return new class($r) extends Router {
+      public function __construct(private Router $inner) {}
+      public function dispatch(\App\Http\Request $req): void {
+        $path = $req->path();
+        $method = strtoupper($req->method());
+
+        // direct routes first
+        $direct = ['/health','/sanctions','/evaluate','/cases','/case','/case/resolve'];
+        if (in_array($path, $direct, true)) {
+          $this->inner->dispatch($req);
+          return;
+        }
+
+        // route dynamic paths through /_dynamic
+        $_SERVER['REQUEST_URI'] = '/_dynamic';
+        $_SERVER['REQUEST_METHOD'] = $method;
+        $this->inner->dispatch($req);
+      }
+    };
   }
 }
