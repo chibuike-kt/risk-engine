@@ -8,8 +8,8 @@ final class DecisionRepository {
 
   public function store(array $d): void {
     $stmt = $this->pdo->prepare("INSERT INTO decisions
-      (id,user_id,action,amount_minor,currency,counterparty,country,device_id,outcome,risk_score,risk_tier,reasons_json,created_at)
-      VALUES (:id,:u,:a,:amt,:cur,:cp,:country,:dev,:out,:score,:tier,:reasons,:t)");
+      (id,user_id,action,amount_minor,currency,counterparty,country,device_id,outcome,risk_score,risk_tier,reasons_json,created_at,case_id)
+      VALUES (:id,:u,:a,:amt,:cur,:cp,:country,:dev,:out,:score,:tier,:reasons,:t,:case_id)");
     $stmt->execute([
       ':id'=>$d['id'],
       ':u'=>$d['user_id'],
@@ -24,7 +24,13 @@ final class DecisionRepository {
       ':tier'=>$d['risk_tier'],
       ':reasons'=>json_encode($d['reasons'], JSON_UNESCAPED_SLASHES),
       ':t'=>$d['created_at'],
+      ':case_id'=>$d['case_id'] ?? null,
     ]);
+  }
+
+  public function attachCase(string $decisionId, string $caseId): void {
+    $stmt = $this->pdo->prepare("UPDATE decisions SET case_id = :c WHERE id = :d");
+    $stmt->execute([':c'=>$caseId, ':d'=>$decisionId]);
   }
 
   public function countRecent(string $userId, int $windowSeconds): int {
