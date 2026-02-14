@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS sanctions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  value TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL, -- ADDRESS | NAME | EMAIL
+  added_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sanctions_value ON sanctions(value);

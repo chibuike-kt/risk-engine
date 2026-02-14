@@ -1,0 +1,42 @@
+#!/usr/bin/env php
+<?php
+require __DIR__ . '/../vendor/autoload.php';
+
+$config = require __DIR__ . '/../config/app.php';
+$dbPath = $config['db']['path'];
+
+$pdo = (new App\Db\Db($dbPath))->pdo();
+$migrationsDir = __DIR__ . '/../database/migrations';
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS migrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename TEXT NOT NULL UNIQUE,
+  applied_at TEXT NOT NULL
+);");
+
+$applied = $pdo->query("SELECT filename FROM migrations")->fetchAll(PDO::FETCH_COLUMN);
+$appliedSet = array_flip($applied);
+
+$files = glob($migrationsDir . '/*.sql');
+sort($files);
+
+foreach ($files as $file) {
+  $name = basename($file);
+  if (isset($appliedSet[$name])) continue;
+
+  $sql = file_get_contents($file);
+  $pdo->beginTransaction();
+  try {
+    $pdo->exec($sql);
+    $stmt = $pdo->prepare("INSERT INTO migrations (filename, applied_at) VALUES (:f, :t)");
+    $stmt->execute([':f' => $name, ':t' => gmdate('c')]);
+    $pdo->commit();
+    echo "applied: {$name}\n";
+  } catch (Throwable $e) {
+    $pdo->rollBack();
+    fwrite(STDERR, "failed: {$name}\n{$e->getMessage()}\n");
+    exit(1);
+  }
+}
+
+echo "done\n";
