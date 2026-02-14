@@ -51,3 +51,23 @@ Response includes outcome, risk score, tier, reasons, and a decision_id.
 
 Testing
 composer test
+
+Case Management
+When an evaluation outcome is HOLD or REVIEW, a case is automatically opened and linked to the decision.
+
+List open cases
+GET /cases?status=open
+
+List resolved cases
+GET /cases?status=resolved
+
+Get a case
+GET /cases/{case_id}
+
+Resolve a case
+POST /cases/{case_id}/resolve
+Body:
+{
+  "resolution": "APPROVE",
+  "notes": "KYC verified, allow withdrawal"
+}
