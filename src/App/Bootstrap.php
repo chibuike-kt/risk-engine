@@ -39,6 +39,23 @@ final class Bootstrap {
 
     $r->add('GET', '/audit/verify', function() use ($audit) {
       JsonResponse::send(200, $audit->verifyChain());
+
+    $checkpoint = new \App\Logging\AuditCheckpoint($pdo);
+
+    $r->add('POST', '/audit/checkpoint', function() use ($audit, $checkpoint) {
+      $v = $audit->verifyChain();
+      if (!($v['ok'] ?? false)) { \App\Http\JsonResponse::send(409, ['error'=>'audit_chain_invalid', 'details'=>$v]); return; }
+      $row = $checkpoint->upsertToday((string)$v['tip_hash'], (int)$v['count']);
+      \App\Http\JsonResponse::send(200, ['checkpoint'=>$row]);
+    });
+
+    $r->add('GET', '/audit/checkpoint', function() use ($checkpoint) {
+      $day = (string)($_GET['day'] ?? gmdate('Y-m-d'));
+      if (!preg_match('/^\d{4}-\d{2}-\d{2}', $day)) { \App\Http\JsonResponse::send(422, ['error'=>'validation', 'field'=>'day']); return; }
+      $row = $checkpoint->get($day);
+      if (!$row) { \App\Http\JsonResponse::send(404, ['error'=>'not_found']); return; }
+      \App\Http\JsonResponse::send(200, ['checkpoint'=>$row]);
+    });
     });
 
     $r->add('POST', '/sanctions', function(Request $req) use ($sanctions, $audit) {
