@@ -71,3 +71,10 @@ Body:
   "resolution": "APPROVE",
   "notes": "KYC verified, allow withdrawal"
 }
+
+Audit Trail
+The service maintains a tamper-evident audit log using a hash chain.
+Each audit record includes prev_hash and hash, where hash = sha256(prev_hash + canonical_event_payload).
+
+Verify audit chain
+GET /audit/verify
