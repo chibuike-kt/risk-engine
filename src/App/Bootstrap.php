@@ -31,6 +31,14 @@ final class Bootstrap {
     $clock = new SystemClock();
     $audit = new AuditLogger($pdo);
 
+    $checkpoint = new \App\Logging\AuditCheckpoint($pdo);
+    $signer = null;
+    try {
+      $signer = new \App\Logging\CheckpointSigner(__DIR__ . '/../../storage/keys/audit_ed25519.key', __DIR__ . '/../../storage/keys/audit_ed25519.pub');
+    } catch (\Throwable $e) {
+      $signer = null;
+    }
+
     $r = new Router();
 
     $r->add('GET', '/health', function() {
@@ -39,6 +47,64 @@ final class Bootstrap {
 
     $r->add('GET', '/audit/verify', function() use ($audit) {
       JsonResponse::send(200, $audit->verifyChain());
+
+
+    $r->add('POST', '/audit/checkpoint/signed', function() use ($audit, $checkpoint, $signer) {
+      if (!$signer) { \App\Http\JsonResponse::send(503, ['error'=>'signer_unavailable']); return; }
+      $v = $audit->verifyChain();
+      if (!($v['ok'] ?? false)) { \App\Http\JsonResponse::send(409, ['error'=>'audit_chain_invalid', 'details'=>$v]); return; }
+      $row = $checkpoint->upsertToday((string)$v['tip_hash'], (int)$v['count']);
+      $sig = $signer->signCheckpoint(['day'=>$row['day'], 'tip_hash'=>$row['tip_hash'], 'audit_count'=>(int)$row['audit_count']]);
+      \App\Http\JsonResponse::send(200, [
+        'checkpoint'=>$row,
+        'signature'=>$sig,
+        'public_key_pem'=>$signer->publicKeyPem()
+      ]);
+    });
+
+    $r->add('POST', '/audit/checkpoint/verify', function(\App\Http\Request $req) use ($signer) {
+      $b = $req->json();
+      $required = ['day','tip_hash','audit_count','signature'];
+      foreach ($required as $k) { if (!isset($b[$k])) { \App\Http\JsonResponse::send(422, ['error'=>'validation', 'missing'=>$k]); return; } }
+      $checkpoint = ['day'=>(string)$b['day'], 'tip_hash'=>(string)$b['tip_hash'], 'audit_count'=>(int)$b['audit_count']];
+      $sig = (string)$b['signature'];
+      $pub = isset($b['public_key_pem']) ? (string)$b['public_key_pem'] : null;
+
+      // If caller supplies pubkey, verify against that. Else verify against local pubkey if signer exists.
+      if (!$pub && !$signer) { \App\Http\JsonResponse::send(503, ['error'=>'no_public_key_available']); return; }
+
+      $verifier = $signer;
+      if (!$verifier) {
+        // Create a temporary verifier using supplied public key only.
+        try {
+          $tmpPriv = __DIR__ . '/../../storage/keys/_tmp_missing.key';
+          $tmpPub  = __DIR__ . '/../../storage/keys/_tmp_missing.pub';
+          file_put_contents($tmpPub, $pub);
+          $verifier = new \App\Logging\CheckpointSigner($tmpPriv, $tmpPub);
+        } catch (\Throwable $e) {
+          // fallback below
+          $verifier = null;
+        }
+      }
+
+      $ok = false;
+      if ($signer) {
+        $ok = $signer->verifyCheckpoint($checkpoint, $sig, $pub);
+      } else {
+        // If no local signer, we require pubkey and verify via OpenSSL directly.
+        $pubKey = openssl_pkey_get_public($pub);
+        if ($pubKey !== false) {
+          $msg = json_encode(['day'=>$checkpoint['day'], 'tip_hash'=>$checkpoint['tip_hash'], 'audit_count'=>(int)$checkpoint['audit_count']], JSON_UNESCAPED_SLASHES);
+          $sigRaw = base64_decode($sig, true);
+          if ($sigRaw !== false) {
+            $ok = (openssl_verify($msg, $sigRaw, $pubKey, OPENSSL_ALGO_ED25519) === 1);
+          }
+          openssl_free_key($pubKey);
+        }
+      }
+
+      \App\Http\JsonResponse::send(200, ['ok'=>$ok]);
+    });
 
     $checkpoint = new \App\Logging\AuditCheckpoint($pdo);
 
