@@ -78,3 +78,18 @@ Each audit record includes prev_hash and hash, where hash = sha256(prev_hash + c
 
 Verify audit chain
 GET /audit/verify
+
+Signed Checkpoints
+Generate signed checkpoint (requires local Ed25519 keys in storage/keys)
+POST /audit/checkpoint/signed
+
+Verify checkpoint signature
+POST /audit/checkpoint/verify
+Body:
+{
+  "day": "2026-02-20",
+  "tip_hash": "....",
+  "audit_count": 123,
+  "signature": "base64...",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"
+}
