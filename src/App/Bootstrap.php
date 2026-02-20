@@ -6,6 +6,8 @@ use App\Http\Router;
 use App\Http\JsonResponse;
 use App\Http\Request;
 
+use App\Logging\AuditLogger;
+
 use Domain\Sanctions\SanctionsRepository;
 use Domain\Users\UserRepository;
 use Domain\Decisions\DecisionRepository;
@@ -27,6 +29,7 @@ final class Bootstrap {
     $sanctions = new SanctionsRepository($pdo);
     $risk = new RiskEngine($cfg['risk'], $users, $decisions, $sanctions);
     $clock = new SystemClock();
+    $audit = new AuditLogger($pdo);
 
     $r = new Router();
 
@@ -34,7 +37,11 @@ final class Bootstrap {
       JsonResponse::send(200, ['ok' => true]);
     });
 
-    $r->add('POST', '/sanctions', function(Request $req) use ($sanctions) {
+    $r->add('GET', '/audit/verify', function() use ($audit) {
+      JsonResponse::send(200, $audit->verifyChain());
+    });
+
+    $r->add('POST', '/sanctions', function(Request $req) use ($sanctions, $audit) {
       $body = $req->json();
       $kind = (string)($body['kind'] ?? 'ADDRESS');
       $value = (string)($body['value'] ?? '');
@@ -43,6 +50,9 @@ final class Bootstrap {
         return;
       }
       $sanctions->add($kind, $value);
+
+      $audit->append('SANCTIONS_ADDED', 'sanctions', $value, ['kind'=>$kind,'value'=>$value], 'system');
+
       JsonResponse::send(201, ['ok'=>true]);
     });
 
@@ -62,18 +72,8 @@ final class Bootstrap {
       JsonResponse::send(200, ['cases'=>$rows]);
     });
 
-    // Get case by id: /cases/{id}
-    $r->add('GET', '/case', function() {
-      JsonResponse::send(400, ['error'=>'use /cases/{id}']);
-    });
-
-    // Resolve case: /cases/{id}/resolve
-    $r->add('POST', '/case/resolve', function() {
-      JsonResponse::send(400, ['error'=>'use /cases/{id}/resolve']);
-    });
-
-    // Evaluate endpoint with idempotency + case creation
-    $r->add('POST', '/evaluate', function(Request $req) use ($risk, $users, $decisions, $idempo, $cases, $clock) {
+    // Evaluate endpoint with idempotency + case creation + audit trail
+    $r->add('POST', '/evaluate', function(Request $req) use ($risk, $users, $decisions, $idempo, $cases, $clock, $audit) {
       $b = $req->json();
 
       $required = ['user_id','action','amount_minor','currency','counterparty'];
@@ -141,7 +141,6 @@ final class Bootstrap {
       $decisionId = bin2hex(random_bytes(16));
       $createdAt = $clock->nowIso();
 
-      // If HOLD/REVIEW, open a case
       $caseId = null;
       if (in_array($result['outcome'], ['HOLD','REVIEW'], true)) {
         $caseId = bin2hex(random_bytes(16));
@@ -189,13 +188,36 @@ final class Bootstrap {
 
       $idempo->save($idempoKey, $input['user_id'], $requestHash, $response, $decisionId);
 
+      // Audit entries
+      $audit->append('DECISION_CREATED', 'decision', $decisionId, [
+        'user_id'=>$input['user_id'],
+        'action'=>$input['action'],
+        'amount_minor'=>$input['amount_minor'],
+        'currency'=>$input['currency'],
+        'counterparty'=>$input['counterparty'],
+        'outcome'=>$result['outcome'],
+        'risk_score'=>$result['risk_score'],
+        'risk_tier'=>$result['risk_tier'],
+        'case_id'=>$caseId
+      ], 'system');
+
+      if ($caseId) {
+        $audit->append('CASE_OPENED', 'case', $caseId, [
+          'user_id'=>$input['user_id'],
+          'decision_id'=>$decisionId,
+          'outcome'=>$result['outcome'],
+          'risk_score'=>$result['risk_score'],
+          'risk_tier'=>$result['risk_tier'],
+          'reasons'=>$result['reasons']
+        ], 'system');
+      }
+
       JsonResponse::send(200, $response);
     });
 
-    // Dynamic routes handling: we’ll do simple dispatcher based on path patterns
+    // Dynamic routes for /cases/{id} and /cases/{id}/resolve
     $r->add('GET', '/_dynamic', function(Request $req) use ($cases) {
       $p = $req->path();
-      // /cases/{id}
       if (preg_match('#^/cases/([a-f0-9]{32})$#', $p, $m)) {
         $row = $cases->get($m[1]);
         if (!$row) { JsonResponse::send(404, ['error'=>'not_found']); return; }
@@ -207,19 +229,27 @@ final class Bootstrap {
       JsonResponse::send(404, ['error'=>'not_found', 'path'=>$p]);
     });
 
-    $r->add('POST', '/_dynamic', function(Request $req) use ($cases) {
+    $r->add('POST', '/_dynamic', function(Request $req) use ($cases, $audit) {
       $p = $req->path();
-      // /cases/{id}/resolve
       if (preg_match('#^/cases/([a-f0-9]{32})/resolve$#', $p, $m)) {
         $b = $req->json();
         $resolution = strtoupper((string)($b['resolution'] ?? ''));
         $notes = (string)($b['notes'] ?? '');
+        $actor = $req->header('X-Actor') ?? 'analyst';
+
         if (!in_array($resolution, ['APPROVE','DENY'], true)) {
           JsonResponse::send(422, ['error'=>'validation', 'field'=>'resolution', 'allowed'=>['APPROVE','DENY']]);
           return;
         }
+
         $ok = $cases->resolve($m[1], $resolution, $notes);
         if (!$ok) { JsonResponse::send(409, ['error'=>'case_not_open_or_missing']); return; }
+
+        $audit->append('CASE_RESOLVED', 'case', $m[1], [
+          'resolution'=>$resolution,
+          'notes'=>$notes
+        ], $actor);
+
         JsonResponse::send(200, ['ok'=>true]);
         return;
       }
@@ -232,14 +262,12 @@ final class Bootstrap {
         $path = $req->path();
         $method = strtoupper($req->method());
 
-        // direct routes first
-        $direct = ['/health','/sanctions','/evaluate','/cases','/case','/case/resolve'];
+        $direct = ['/health','/sanctions','/evaluate','/cases','/audit/verify'];
         if (in_array($path, $direct, true)) {
           $this->inner->dispatch($req);
           return;
         }
 
-        // route dynamic paths through /_dynamic
         $_SERVER['REQUEST_URI'] = '/_dynamic';
         $_SERVER['REQUEST_METHOD'] = $method;
         $this->inner->dispatch($req);
