@@ -1,0 +1,67 @@
+#!/usr/bin/env php
+<?php
+$base = "http://127.0.0.1:8000";
+
+function post(string $url, array $data, ?string $idempo=null, array $headers=[]): array {
+  $ch = curl_init($url);
+  $hdr = array_merge(["Content-Type: application/json"], $headers);
+  if ($idempo) $hdr[] = "Idempotency-Key: " . $idempo;
+
+  curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_HTTPHEADER => $hdr,
+    CURLOPT_POSTFIELDS => json_encode($data, JSON_UNESCAPED_SLASHES),
+  ]);
+  $out = curl_exec($ch);
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+  $json = json_decode($out ?: '', true);
+  return ['code'=>$code, 'json'=>$json, 'raw'=>$out];
+}
+
+echo "seeding sanctions...\n";
+post($base . "/sanctions", ['kind'=>'ADDRESS','value'=>'0xBAD']);
+
+$user = "user_sim_1";
+$device = "device_a";
+
+echo "normal behavior...\n";
+for ($i=1; $i<=5; $i++) {
+  $r = post($base."/evaluate", [
+    'user_id'=>$user,'action'=>'withdraw','amount_minor'=>1500,'currency'=>'USD',
+    'counterparty'=>'0xOK','country'=>'US','device_id'=>$device
+  ], "sim-normal-$i");
+  echo $i . " outcome=" . ($r['json']['outcome'] ?? '??') . "\n";
+}
+
+echo "velocity burst...\n";
+for ($i=1; $i<=8; $i++) {
+  $r = post($base."/evaluate", [
+    'user_id'=>$user,'action'=>'withdraw','amount_minor'=>1200,'currency'=>'USD',
+    'counterparty'=>'0xOK','country'=>'US','device_id'=>$device
+  ], "sim-vel-$i");
+  echo $i . " outcome=" . ($r['json']['outcome'] ?? '??') . " tier=" . ($r['json']['risk_tier'] ?? '??') . "\n";
+}
+
+echo "device + geo change...\n";
+$r = post($base."/evaluate", [
+  'user_id'=>$user,'action'=>'withdraw','amount_minor'=>2200,'currency'=>'USD',
+  'counterparty'=>'0xOK','country'=>'NG','device_id'=>'device_b'
+], "sim-mismatch-1");
+echo "mismatch outcome=" . ($r['json']['outcome'] ?? '??') . "\n";
+
+echo "sanctions hit...\n";
+$r = post($base."/evaluate", [
+  'user_id'=>$user,'action'=>'withdraw','amount_minor'=>1000,'currency'=>'USD',
+  'counterparty'=>'0xBAD','country'=>'US','device_id'=>'device_b'
+], "sim-sanctions-1");
+echo "sanctions outcome=" . ($r['json']['outcome'] ?? '??') . "\n";
+
+echo "audit verify...\n";
+$verify = file_get_contents($base . "/audit/verify");
+echo $verify . "\n";
+
+echo "checkpoint...\n";
+$cp = post($base . "/audit/checkpoint", [], null);
+echo json_encode($cp['json'], JSON_UNESCAPED_SLASHES) . "\n";
